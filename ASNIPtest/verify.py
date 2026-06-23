@@ -5,7 +5,7 @@ ASNIPtest - CF Node Verifier (Windows Enhanced)
 支持 TLS 本地验证和 API 远程验证
 精筛失败时自动回退保留粗筛结果
 """
-import argparse, urllib.request, json, time, sys, ssl, socket
+import argparse, urllib.request, json, time, sys, ssl, socket, os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def check_single_tls(ip_port):
@@ -86,7 +86,7 @@ def main():
     check_func = check_single_tls if args.mode == "tls" else lambda x: check_single_api(x, args.api)
 
     with open(args.output, "w", encoding="utf-8") as out:
-        out.write("IP地址,端口,TLS,数据中心,地区,城市,网络延迟,下载速度,ASN\n")
+        out.write("IP,Port,TLS,Colo,Country,Region,Latency,Speed,ASN\n")
         for i in range(0, total, args.chunk):
             chunk = all_lines[i:i + args.chunk]
             with ThreadPoolExecutor(max_workers=args.concurrent) as ex:
@@ -107,14 +107,18 @@ def main():
             pct = done / total * 100
             bar_width = 30
             filled = int(bar_width * pct / 100)
-            bar = "█" * filled + "░" * (bar_width - filled)
-            sys.stderr.write(f"\r  [{bar}] {pct:.1f}% | Passed {passed} | {rate:.1f}/s | ETA {eta/60:.1f}m   ")
-            sys.stderr.flush()
+            bar = "#" * filled + "-" * (bar_width - filled)
+            msg = "  [%s] %.1f%% | Passed %d | %.1f/s | ETA %.1fm   " % (bar, pct, passed, rate, eta/60)
+            try:
+                sys.stderr.write("\r" + msg)
+                sys.stderr.flush()
+            except:
+                pass
 
     if passed == 0 and args.fallback and total > 0:
-        print("\n  No nodes passed verification, using rough filter results as fallback")
+        print("  No nodes passed verification, using rough filter results as fallback")
         with open(args.output, "w", encoding="utf-8") as out:
-            out.write("IP地址,端口,TLS,数据中心,地区,城市,网络延迟,下载速度,ASN\n")
+            out.write("IP,Port,TLS,Colo,Country,Region,Latency,Speed,ASN\n")
             for ip_port in all_lines:
                 if ip_port:
                     ip, port = ip_port.rsplit(":", 1)
@@ -122,8 +126,12 @@ def main():
         passed = total
 
     elapsed = int(time.time() - start)
-    sys.stderr.write(f"\r  [{'█' * 30}] 100.0% | Passed {passed}/{total} | {elapsed//60}min{'':20}\n")
-    print(f"Passed: {passed}")
+    msg = "  [%s] 100.0%% | Passed %d/%d | %dmin" % ("#" * 30, passed, total, elapsed//60)
+    try:
+        sys.stderr.write("\r" + msg + " " * 20 + "\n")
+    except:
+        pass
+    print("Passed: %d" % passed)
 
 if __name__ == "__main__":
     main()
