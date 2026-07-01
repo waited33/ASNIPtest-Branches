@@ -26,6 +26,7 @@
 **Linux / macOS**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/e13815332/ASNIPtest/main/install.sh | bash
+cmtjd
 ```
 
 **Windows**（需先装 WSL2）
@@ -35,6 +36,7 @@ wsl --install
 
 # 重启后进 Ubuntu 终端
 curl -fsSL https://raw.githubusercontent.com/e13815332/ASNIPtest/main/install.sh | bash
+cmtjd
 ```
 
 ---
@@ -73,9 +75,10 @@ wsl --install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/e13815332/ASNIPtest/main/install.sh | bash
+cmtjd
 ```
 
-> WSL2 默认使用桥接模式，正式测试时需调整为 NAT 模式才能正常使用 masscan。
+> WSL2 和真实 Linux 体验完全一致，masscan 原生运行无任何限制。
 
 ---
 
@@ -112,7 +115,7 @@ cmtjd
 
 输入 ASN 后自动开始扫描。完成后自动提供 CSV 下载链接。
 
-> 扫描完成后提供手动测速选项（TCP 延迟 + CF 下载带宽），用户可选择是否测速。
+> 如果运行在国内网络环境，扫描完成后还会自动测速（TCP 延迟 + CF 下载带宽）。海外环境跳过测速，直接输出结果。
 
 ---
 
@@ -125,13 +128,15 @@ cmtjd
 ┌──────────────────────┐
 │ 1. ASN → CIDR        │  RIPEStat API 查询该 ASN 广播的所有 IPv4 前缀
 ├──────────────────────┤
-│ 2. masscan 端口扫描   │  高速 SYN 扫描（CIDR 直接传入，跳过 prips 展开）
+│ 2. CIDR → IP 列表    │  prips 展开 CIDR 为完整 IP 地址
 ├──────────────────────┤
-│ 3. cf-scanner 粗筛   │  TLS 握手检测，命中 Cloudflare 反代节点
+│ 3. masscan 端口扫描   │  高速 SYN 扫描，检测开放端口
 ├──────────────────────┤
-│ 4. API 精筛          │  api.090227.xyz/check 二次验证（TLS + 数据中心 + 地区）
+│ 4. cf-scanner 粗筛   │  TLS 握手检测，过滤 Cloudflare 反代节点
 ├──────────────────────┤
-│ 5. 手动测速（可选）    │  TCP 延迟 + CF 文件下载速度
+│ 5. API 精筛          │  二次验证节点可用性（TLS + 数据中心 + 地区）
+├──────────────────────┤
+│ 6. 测速（仅国内）     │  TCP 延迟 + CF 文件下载速度
 ├──────────────────────┤
 │ 输出 CSV + 下载链接   │  临时 HTTP 服务提供文件下载
 └──────────────────────┘
@@ -161,22 +166,25 @@ http://1.2.3.4:8899/output_AS209242_20260617_120000.csv
 | 地区 | 国家/地区代码 | `HK` |
 | 城市 | 城市名 | `Hong Kong` |
 | 网络延迟 | TCP 延迟 (ms) | `42` |
-| 下载速度 | CF 下载带宽 (Mbps) | `5.12` |
+| 下载速度 | CF 下载带宽 (KB/s) | `5120` |
 | ASN | 源 ASN 编号 | `AS209242` |
 
-> 下载链接自动检测本机 IP，同时显示局域网和公网地址（公网不同时）。按 **回车** 关闭下载服务。
+> 下载链接自动检测公网 IP（ipify → ip.sb → 宿主机网关三重兜底），Docker/NAT 环境下也能正常工作。按 **回车** 关闭下载服务。
 
 ---
 
 ## 硬件自适应
 
-启动时自动探测网卡实际发包能力（取最优速率的 80%），同时根据 CPU 核数和内存调整并发：
+根据 CPU 核数和可用内存自动调整扫描参数，无需手动配置：
 
 | 硬件配置 | masscan 速率 | cf-scanner 并发 | API 并发 |
 |---|---|---|---|
-| 任何配置 | 自动实测网卡上限×80% | 200~500 | 8~32 |
+| 2 核 / 1 GB | 2,000 pps | 200 | 8 |
+| 4 核 / 2 GB | 4,000 pps | 400 | 32 |
+| 8 核 / 8 GB | 8,000 pps | 500 | 32 |
+| 16 核 / 16 GB | 16,000 pps | 500 | 32 |
 
-> 速率探测耗时约 30 秒，使用前 50 个 CIDR 样本以递增速率测试，找到网卡瓶颈后稳定运行。探测失败时回退 CPU×1000 估算。cf-scanner 并发最低 200，最高 500。
+> cf-scanner 并发最低 200，最高 500。masscan 速率 = CPU 核数 × 1000。
 
 ---
 
@@ -185,20 +193,11 @@ http://1.2.3.4:8899/output_AS209242_20260617_120000.csv
 | 工具 | 用途 | 安装方式 |
 |---|---|---|
 | [masscan](https://github.com/robertdavidgraham/masscan) | 高速端口扫描 | `apt install masscan` 或源码编译 |
+| prips | CIDR → IP 段展开 | `apt install prips` |
 | cf-scanner | CF 反代节点检测 | 内置，自动编译 |
 | [RIPEStat API](https://stat.ripe.net/) | ASN → CIDR | 免费公开，无需注册 |
 
 > `install.sh` 自动处理所有依赖。
-
-### 不支持的环境
-
-masscan 依赖 **raw socket**（CAP_NET_RAW），以下环境有限制：
-
-- ❌ NAT 容器（独角鲸/小鲸等，缺少 CAP_NET_RAW）
-- ❌ OpenVZ / LXC 未开启特权模式
-- ⚠️ WSL2 需切换为 NAT 网络模式（默认桥接不支持 raw socket）
-
-> 换到 KVM VPS 或物理机即可正常使用。
 
 ---
 
@@ -209,9 +208,3 @@ curl -fsSL https://raw.githubusercontent.com/e13815332/ASNIPtest/main/uninstall.
 ```
 
 这会删除 `cmtjd` 命令和 `~/ASNIPtest` 目录。
-
----
-
-## 鸣谢
-
-- [**cmliu**](https://github.com/cmliu) — 提供 [CF-Workers-CheckProxyIP](https://github.com/cmliu/CF-Workers-CheckProxyIP) 公共 API 接口 (`api.090227.xyz/check`)，用于节点二次验证。

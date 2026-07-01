@@ -11,7 +11,7 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[0;33m'; NC='\033[0m'
 BOLD='\033[1m'
 
-VERSION="v1.1.0"
+VERSION="v1.0.14"
 
 logo() {
     echo -e "${CYAN}${BOLD}"
@@ -57,60 +57,14 @@ do_update() {
     else
         info "${YELLOW}$OLD_VER → $NEW_VER${NC} 已更新"
         info "重新编译 cf-scanner..."
-        rm -rf "$PROJECT_DIR/cf-scanner"    # 清除旧二进制
+        rm -rf "$PROJECT_DIR/cf-scanner"    # 清除旧源码目录
         cd "$PROJECT_DIR/cf-scanner-src"
-        ensure_go
         if grep -q avx2 /proc/cpuinfo 2>/dev/null; then GOAMD=""; else GOAMD="GOAMD64=v2"; fi
         env $GOAMD go build -o "$PROJECT_DIR/cf-scanner" main.go
         chmod +x "$PROJECT_DIR/cf-scanner"
     fi
     echo ""
     echo -e "${GREEN}✅ 版本 $NEW_VER${NC}"
-}
-
-# ── Go 安装（install/update 共用）──
-ensure_go() {
-    local GO_VER="1.22.2"
-    local GO_ARCH="linux-amd64"
-    local GO_MIN_MAJOR=1
-    local GO_MIN_MINOR=22
-
-    if command -v go &>/dev/null; then
-        local GO_CUR=$(go version | grep -oP 'go\K[0-9]+\.[0-9]+')
-        local GO_MAJOR=${GO_CUR%%.*}
-        local GO_MINOR=${GO_CUR#*.}
-        if [ "$GO_MAJOR" -gt "$GO_MIN_MAJOR" ] || { [ "$GO_MAJOR" -eq "$GO_MIN_MAJOR" ] && [ "$GO_MINOR" -ge "$GO_MIN_MINOR" ]; }; then
-            info "Go $GO_CUR 已安装"
-            return 0
-        fi
-        warn "Go $GO_CUR 版本过低，需要 ≥${GO_MIN_MAJOR}.${GO_MIN_MINOR}"
-    fi
-
-    warn "安装 Go $GO_VER ..."
-    local GO_DOWNLOADED=false
-    for GO_URL in \
-        "https://golang.google.cn/dl/go${GO_VER}.${GO_ARCH}.tar.gz" \
-        "https://go.dev/dl/go${GO_VER}.${GO_ARCH}.tar.gz"; do
-        if curl -fsSL --connect-timeout 10 "$GO_URL" -o /tmp/go.tar.gz 2>/dev/null; then
-            GO_DOWNLOADED=true
-            break
-        fi
-        warn "  下载失败: $GO_URL"
-    done
-    if ! $GO_DOWNLOADED; then
-        warn "Go 下载失败，请手动安装 Go ≥${GO_MIN_MAJOR}.${GO_MIN_MINOR} 后重试"
-        exit 1
-    fi
-    $SUDO rm -rf /usr/local/go
-    $SUDO tar -C /usr/local -xzf /tmp/go.tar.gz
-    rm -f /tmp/go.tar.gz
-    export PATH="/usr/local/go/bin:$PATH"
-    for RC in "$HOME/.profile" "$HOME/.bashrc"; do
-        if ! grep -q '/usr/local/go/bin' "$RC" 2>/dev/null; then
-            echo 'export PATH="/usr/local/go/bin:$PATH"' >> "$RC"
-        fi
-    done
-    info "Go $GO_VER 安装完成"
 }
 
 # ── 安装 ──
@@ -157,7 +111,20 @@ do_install() {
     install_pkg git
 
     # Go
-    ensure_go
+    info "检查 Go..."
+    if command -v go &>/dev/null; then
+        GO_VERSION=$(go version | grep -oP 'go\K[0-9.]+')
+        info "Go $GO_VERSION 已安装"
+    else
+        GO_VER="1.22.2"
+        GO_ARCH="linux-amd64"
+        warn "安装 Go $GO_VER ..."
+        curl -fsSL "https://go.dev/dl/go${GO_VER}.${GO_ARCH}.tar.gz" -o /tmp/go.tar.gz
+        $SUDO tar -C /usr/local -xzf /tmp/go.tar.gz
+        rm -f /tmp/go.tar.gz
+        export PATH="/usr/local/go/bin:$PATH"
+        info "Go $GO_VER 安装完成"
+    fi
 
     # 克隆
     if [ -d "$PROJECT_DIR/.git" ]; then
@@ -183,7 +150,7 @@ do_install() {
 
     # 编译
     info "编译 cf-scanner..."
-    rm -rf "$PROJECT_DIR/cf-scanner"    # 清除旧二进制
+    rm -rf "$PROJECT_DIR/cf-scanner"    # 清除旧源码目录
     cd "$PROJECT_DIR/cf-scanner-src"
     if grep -q avx2 /proc/cpuinfo 2>/dev/null; then GOAMD=""; else GOAMD="GOAMD64=v2"; fi
     env $GOAMD go build -o "$PROJECT_DIR/cf-scanner" main.go

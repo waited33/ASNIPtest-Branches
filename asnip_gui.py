@@ -1,331 +1,551 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ASNIPtest Windows GUI 版本
-从 ASN 编号出发，自动完成 IP 段拉取 → 端口扫描 → Cloudflare 反代节点检测
+ASNIPtest Windows GUI - Cloudflare 节点扫描工具图形界面
 """
-
 import tkinter as tk
-from tkinter import ttk, scrolledtext, filedialog, messagebox
-import threading
-import sys
-import os
-import subprocess
-import json
-import urllib.request
-import multiprocessing
-import socket
-import time
-import re
+from tkinter import ttk, messagebox, filedialog
+import sys, os, subprocess, json, urllib.request, multiprocessing, socket, time, re, threading
 from pathlib import Path
 from datetime import datetime
-import ctypes
 
-# 设置高DPI支持
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(1)
-except:
-    pass
+BASE = Path(__file__).parent.resolve()
+MASSCAN_EXE = BASE / "masscan.exe"
+CF_SCANNER_EXE = BASE / "cf-scanner.exe"
+VERIFY_PY = BASE / "verify.py"
+PORTS_FILE = BASE / "ports.txt"
+VERSION_FILE = BASE / "VERSION"
+
+IS_WINDOWS = sys.platform == "win32"
+if IS_WINDOWS:
+    CREATE_NO_WINDOW = 0x08000000
+else:
+    CREATE_NO_WINDOW = 0
+
+def detect_hardware():
+    cpu = multiprocessing.cpu_count()
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_uint32),
+                        ("dwMemoryLoad", ctypes.c_uint32),
+                        ("ullTotalPhys", ctypes.c_uint64),
+                        ("ullAvailPhys", ctypes.c_uint64),
+                        ("ullTotalPageFile", ctypes.c_uint64),
+                        ("ullAvailPageFile", ctypes.c_uint64),
+                        ("ullTotalVirtual", ctypes.c_uint64),
+                        ("ullAvailVirtual", ctypes.c_uint64),
+                        ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+        ms = MEMORYSTATUSEX()
+        ms.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+        mem_mb = ms.ullTotalPhys // (1024 * 1024)
+    except:
+        mem_mb = 2048
+    return cpu, mem_mb
 
 class ASNIPtestGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("ASNIPtest - Cloudflare 节点扫描工具 v1.1.0")
-        self.root.geometry("900x700")
-        self.root.minsize(800, 600)
-        
-        # 设置图标（如果存在）
-        icon_path = Path(__file__).parent / "icon.ico"
-        if icon_path.exists():
-            root.iconbitmap(str(icon_path))
-        
-        # 变量
-        self.asn_var = tk.StringVar()
-        self.ports_var = tk.StringVar(value="443,8443,2053,2083,2087,2096")
-        self.speed_test_var = tk.BooleanVar(value=False)
-        self.speed_test_url_var = tk.StringVar(value="https://speed.cloudflare.com/__down?bytes=1048576")
-        self.rate_var = tk.StringVar(value="自动")
-        
-        # 验证设置
-        self.verify_mode_var = tk.StringVar(value="tls")  # tls 或 api
-        self.verify_api_var = tk.StringVar(value="https://api.090227.xyz/check")
-        self.verify_concurrent_var = tk.IntVar(value=64)
-        
-        self.is_running = False
+        self.root.title(f"ASNIPtest - Cloudflare 节点扫描工具 v{self.get_version()}")
+        self.root.geometry("720x560")
+        self.root.resizable(True, True)
+
         self.process = None
-        
-        # 硬件信息
-        self.cpu_cores = multiprocessing.cpu_count()
-        self.ram_mb = self.get_ram_mb()
-        
+        self.scan_running = False
+        self.cpu_cores, self.ram_mb = detect_hardware()
+        self.recommended_rate = 4000
+        self._anim_running = False
+        self._anim_base = 0
+        self._anim_range = 0
+        self._anim_dots = 0
+
         self.setup_ui()
+        self.setup_styles()
+        self.update_sys_info()
         self.check_dependencies()
-        
-    def get_ram_mb(self):
+
+        self.download_geoip_db()
+
+    def download_geoip_db(self):
+        geoip_db = BASE / "GeoLite2-City.mmdb"
+        if geoip_db.exists():
+            self.log("GeoIP 数据库已存在")
+            return
+        self.log("正在后台下载 GeoIP 数据库...")
+        def _download():
+            import subprocess
+            urls = [
+                "https://git.io/GeoLite2-City.mmdb",
+                "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/master/GeoLite2-City.mmdb",
+                "https://cdn.jsdelivr.net/gh/P3TERX/GeoLite.mmdb@master/GeoLite2-City.mmdb",
+                "https://raw.githubusercontentcontent.com/adysec/IP_database/main/geolite/GeoLite2-City.mmdb",
+                "https://cdn.jsdelivr.net/gh/adysec/IP_database@main/geolite/GeoLite2-City.mmdb",
+                "https://raw.gitmirror.com/adysec/IP_database/main/geolite/GeoLite2-City.mmdb",
+                "https://ghproxy.net/https://raw.githubusercontent.com/adysec/IP_database/main/geolite/GeoLite2-City.mmdb",
+                "https://gh.api.99988866.xyz/https://raw.githubusercontent.com/adysec/IP_database/main/geolite/GeoLite2-City.mmdb",
+                "https://raw.githubusercontent.com/adysec/IP_database/main/geolite/GeoLite2-City.mmdb",
+            ]
+            for url in urls:
+                try:
+                    self.log(f"  尝试: {url}")
+                    ps_script = f"""
+$ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+[Net.ServicePointManager]::ServerCertificateValidationCallback = {{$true}}
+try {{
+    $wc = New-Object System.Net.WebClient
+    $wc.DownloadFile('{url}', '{geoip_db}')
+    $size = (Get-Item '{geoip_db}').Length
+    Write-Output "SUCCESS|$size"
+}} catch {{
+    Write-Output "ERROR|$($_.Exception.Message)"
+}}
+"""
+                    result = subprocess.run(
+                        ["powershell", "-Command", ps_script],
+                        capture_output=True, text=True, timeout=330
+                    )
+                    output = result.stdout.strip()
+                    if output.startswith("SUCCESS|"):
+                        size = int(output.split("|")[1])
+                        if size > 1024 * 1024:
+                            self.log(f"  GeoIP 数据库下载成功 ({size//1024//1024}MB)")
+                            return
+                        else:
+                            if geoip_db.exists():
+                                geoip_db.unlink()
+                            self.log(f"  文件太小({size}字节)，可能下载失败")
+                    else:
+                        err_msg = output.replace("ERROR|", "") if "ERROR|" in output else result.stderr[:80]
+                        if geoip_db.exists():
+                            geoip_db.unlink()
+                        self.log(f"  下载失败: {err_msg}")
+                except Exception as e:
+                    if geoip_db.exists():
+                        geoip_db.unlink()
+                    self.log(f"  失败: {str(e)[:80]}")
+                    continue
+            self.log("GeoIP 数据库下载失败，地区信息将为空")
+            self.log("提示: 请手动下载 GeoLite2-City.mmdb 放到项目目录")
+            self.log("下载地址: https://raw.gitmirror.com/adysec/IP_database/main/geolite/GeoLite2-City.mmdb")
+        threading.Thread(target=_download, daemon=True).start()
+
+    def get_version(self):
         try:
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-            stat = MEMORYSTATUSEX()
-            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-            return stat.ullAvailPhys // (1024 * 1024)
+            return VERSION_FILE.read_text().strip()
         except:
-            return 512
-    
+            return "1.0.14"
+
     def setup_ui(self):
-        # 主框架
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # ===== 输入区域 =====
-        input_frame = ttk.LabelFrame(main_frame, text="扫描设置", padding="10")
-        input_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        # ASN 输入
-        asn_frame = ttk.Frame(input_frame)
-        asn_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(asn_frame, text="ASN 编号:", width=12).pack(side=tk.LEFT)
-        asn_entry = ttk.Entry(asn_frame, textvariable=self.asn_var, width=50)
-        asn_entry.pack(side=tk.LEFT, padx=5)
-        ttk.Label(asn_frame, text="(多个用逗号分隔，如: AS209242,AS3214)", foreground="gray").pack(side=tk.LEFT)
-        
-        # 端口输入
-        port_frame = ttk.Frame(input_frame)
-        port_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(port_frame, text="扫描端口:", width=12).pack(side=tk.LEFT)
-        port_entry = ttk.Entry(port_frame, textvariable=self.ports_var, width=50)
-        port_entry.pack(side=tk.LEFT, padx=5)
-        ttk.Label(port_frame, text="(如: 443 或 1-1000 或 443,8443)", foreground="gray").pack(side=tk.LEFT)
-        
-        # 选项
-        options_frame = ttk.Frame(input_frame)
-        options_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(options_frame, text="扫描速率:", width=12).pack(side=tk.LEFT)
-        rate_combo = ttk.Combobox(options_frame, textvariable=self.rate_var, width=15, state="readonly")
-        rate_combo['values'] = ("自动", "1000", "2000", "5000", "10000", "20000")
-        rate_combo.pack(side=tk.LEFT, padx=5)
-        
-        ttk.Checkbutton(options_frame, text="启用测速", variable=self.speed_test_var).pack(side=tk.LEFT, padx=20)
-        
-        # 测速网址
-        speed_url_frame = ttk.Frame(input_frame)
-        speed_url_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(speed_url_frame, text="测速网址:", width=12).pack(side=tk.LEFT)
-        speed_url_entry = ttk.Entry(speed_url_frame, textvariable=self.speed_test_url_var, width=70)
-        speed_url_entry.pack(side=tk.LEFT, padx=5)
-        ttk.Label(speed_url_frame, text="(默认: Cloudflare 测速)", foreground="gray").pack(side=tk.LEFT)
-        
-        # ===== 验证设置 =====
-        verify_frame = ttk.LabelFrame(input_frame, text="验证设置", padding="10")
-        verify_frame.pack(fill=tk.X, pady=(10, 5))
-        
-        # 验证模式
-        verify_mode_frame = ttk.Frame(verify_frame)
-        verify_mode_frame.pack(fill=tk.X, pady=2)
-        
-        ttk.Label(verify_mode_frame, text="验证模式:", width=12).pack(side=tk.LEFT)
-        ttk.Radiobutton(verify_mode_frame, text="TLS本地验证", variable=self.verify_mode_var, value="tls", 
-                        command=self.on_verify_mode_change).pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(verify_mode_frame, text="API远程验证", variable=self.verify_mode_var, value="api",
-                        command=self.on_verify_mode_change).pack(side=tk.LEFT, padx=5)
-        
-        # API地址
-        self.api_url_frame = ttk.Frame(verify_frame)
-        self.api_url_frame.pack(fill=tk.X, pady=2)
-        
-        ttk.Label(self.api_url_frame, text="API 地址:", width=12).pack(side=tk.LEFT)
-        self.api_url_entry = ttk.Entry(self.api_url_frame, textvariable=self.verify_api_var, width=50)
-        self.api_url_entry.pack(side=tk.LEFT, padx=5)
-        ttk.Label(self.api_url_frame, text="(API验证模式使用)", foreground="gray").pack(side=tk.LEFT)
-        
-        # 并发数
-        concurrent_frame = ttk.Frame(verify_frame)
-        concurrent_frame.pack(fill=tk.X, pady=2)
-        
-        ttk.Label(concurrent_frame, text="验证并发:", width=12).pack(side=tk.LEFT)
-        concurrent_combo = ttk.Combobox(concurrent_frame, textvariable=self.verify_concurrent_var, width=15, state="readonly")
-        concurrent_combo['values'] = (16, 32, 64, 128, 256)
-        concurrent_combo.pack(side=tk.LEFT, padx=5)
-        ttk.Label(concurrent_frame, text=f"推荐: {min(self.cpu_cores * 16, 64)} (CPU {self.cpu_cores} 核)", foreground="gray").pack(side=tk.LEFT)
-        
-        # 初始化验证模式显示
-        self.on_verify_mode_change()
-        
-        # ===== 系统信息 =====
-        info_frame = ttk.LabelFrame(main_frame, text="系统信息", padding="10")
-        info_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        info_text = f"CPU: {self.cpu_cores} 核  |  内存: {self.ram_mb} MB  |  推荐速率: {min(self.cpu_cores * 1000, 16000)} pps"
-        ttk.Label(info_frame, text=info_text).pack(side=tk.LEFT)
-        
-        # ===== 操作按钮 =====
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        self.start_btn = ttk.Button(button_frame, text="▶ 开始扫描", command=self.start_scan, width=15)
+
+        title_frame = ttk.LabelFrame(main_frame, text="扫描设置", padding="10")
+        title_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(title_frame, text="ASN 编号:").grid(row=0, column=0, sticky=tk.W, pady=3)
+        self.asn_var = tk.StringVar(value="AS209242")
+        self.asn_entry = ttk.Entry(title_frame, textvariable=self.asn_var, width=40)
+        self.asn_entry.grid(row=0, column=1, sticky=tk.W, pady=3, padx=5)
+        ttk.Label(title_frame, text="(多个用逗号分隔)").grid(row=0, column=2, sticky=tk.W, pady=3)
+
+        ttk.Label(title_frame, text="扫描端口:").grid(row=1, column=0, sticky=tk.W, pady=3)
+        self.ports_var = tk.StringVar(value="443,8443,2053,2083,2087,2096")
+        self.ports_entry = ttk.Entry(title_frame, textvariable=self.ports_var, width=40)
+        self.ports_entry.grid(row=1, column=1, sticky=tk.W, pady=3, padx=5)
+
+        ttk.Label(title_frame, text="扫描速率:").grid(row=2, column=0, sticky=tk.W, pady=3)
+        self.rate_var = tk.StringVar(value="自动")
+        rate_options = ["自动", "500", "1000", "2000", "4000", "8000", "16000"]
+        self.rate_combo = ttk.Combobox(title_frame, textvariable=self.rate_var, values=rate_options, width=15, state="readonly")
+        self.rate_combo.grid(row=2, column=1, sticky=tk.W, pady=3, padx=5)
+
+        self.enable_speed_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(title_frame, text="启用测速", variable=self.enable_speed_var).grid(row=2, column=2, sticky=tk.W, pady=3)
+
+        ttk.Label(title_frame, text="测速网址:").grid(row=3, column=0, sticky=tk.W, pady=3)
+        self.speed_url_var = tk.StringVar(value="https://speed.cloudflare.com/__down?bytes=524288")
+        self.speed_url_entry = ttk.Entry(title_frame, textvariable=self.speed_url_var, width=40)
+        self.speed_url_entry.grid(row=3, column=1, sticky=tk.W, pady=3, padx=5)
+
+        verify_frame = ttk.LabelFrame(main_frame, text="验证设置", padding="10")
+        verify_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(verify_frame, text="验证模式:").grid(row=0, column=0, sticky=tk.W, pady=3)
+        self.verify_mode_var = tk.StringVar(value="api")
+        mode_frame = ttk.Frame(verify_frame)
+        mode_frame.grid(row=0, column=1, sticky=tk.W, pady=3, padx=5)
+        ttk.Radiobutton(mode_frame, text="TLS本地验证", variable=self.verify_mode_var, value="tls").pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(mode_frame, text="API远程验证", variable=self.verify_mode_var, value="api").pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(verify_frame, text="API 地址:").grid(row=1, column=0, sticky=tk.W, pady=3)
+        self.api_url_var = tk.StringVar(value="https://api.090227.xyz/check")
+        self.api_url_entry = ttk.Entry(verify_frame, textvariable=self.api_url_var, width=40)
+        self.api_url_entry.grid(row=1, column=1, sticky=tk.W, pady=3, padx=5)
+
+        ttk.Label(verify_frame, text="验证并发:").grid(row=2, column=0, sticky=tk.W, pady=3)
+        self.api_concurrent_var = tk.StringVar(value="32")
+        concurrent_options = ["8", "16", "32", "64", "128"]
+        self.api_concurrent_combo = ttk.Combobox(verify_frame, textvariable=self.api_concurrent_var, values=concurrent_options, width=15, state="readonly")
+        self.api_concurrent_combo.grid(row=2, column=1, sticky=tk.W, pady=3, padx=5)
+
+        sys_frame = ttk.LabelFrame(main_frame, text="系统信息", padding="10")
+        sys_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.sys_info_var = tk.StringVar()
+        ttk.Label(sys_frame, textvariable=self.sys_info_var).pack(anchor=tk.W)
+
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.start_btn = ttk.Button(btn_frame, text="开始扫描", command=self.start_scan, width=15)
         self.start_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.stop_btn = ttk.Button(button_frame, text="⏹ 停止", command=self.stop_scan, width=15, state=tk.DISABLED)
+
+        self.stop_btn = ttk.Button(btn_frame, text="停止", command=self.stop_scan, width=15, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
-        
-        ttk.Button(button_frame, text="📂 打开输出目录", command=self.open_output_dir, width=15).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="🔄 刷新检查", command=self.refresh_check, width=15).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="📋 查看帮助", command=self.show_help, width=15).pack(side=tk.LEFT, padx=5)
-        
-        # ===== 进度条 =====
+
+        ttk.Button(btn_frame, text="打开输出目录", command=self.open_output_dir, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="刷新检查", command=self.check_dependencies, width=15).pack(side=tk.LEFT, padx=5)
+
+        file_btn_frame = ttk.Frame(main_frame)
+        file_btn_frame.pack(fill=tk.X, pady=(0, 10))
+        ttk.Button(file_btn_frame, text="从 cidrs.txt 开始", command=self.load_cidrs_file, width=18).pack(side=tk.LEFT, padx=5)
+        ttk.Button(file_btn_frame, text="从 cf_hits.txt 开始", command=self.load_cf_hits_file, width=18).pack(side=tk.LEFT, padx=5)
+
         progress_frame = ttk.Frame(main_frame)
         progress_frame.pack(fill=tk.X, pady=(0, 10))
-        
+
         self.progress_var = tk.StringVar(value="就绪")
-        ttk.Label(progress_frame, textvariable=self.progress_var).pack(side=tk.LEFT)
-        
-        self.progress_bar = ttk.Progressbar(progress_frame, mode='determinate', length=400)
-        self.progress_bar.pack(side=tk.RIGHT, padx=5)
-        
-        # ===== 日志输出 =====
-        log_frame = ttk.LabelFrame(main_frame, text="运行日志", padding="10")
+        ttk.Label(progress_frame, textvariable=self.progress_var).pack(side=tk.LEFT, padx=(0, 10))
+        self.progress_bar = ttk.Progressbar(progress_frame, mode="determinate", maximum=100)
+        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        log_frame = ttk.LabelFrame(main_frame, text="运行日志", padding="5")
         log_frame.pack(fill=tk.BOTH, expand=True)
-        
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=20, wrap=tk.WORD, font=("Consolas", 9))
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-        
-        # 配置日志颜色标签
-        self.log_text.tag_config("info", foreground="black")
-        self.log_text.tag_config("success", foreground="green")
-        self.log_text.tag_config("error", foreground="red")
-        self.log_text.tag_config("warning", foreground="orange")
-        self.log_text.tag_config("progress", foreground="blue")
-        
-        # ===== 状态栏 =====
-        status_frame = ttk.Frame(main_frame)
-        status_frame.pack(fill=tk.X, pady=(5, 0))
-        
-        self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(status_frame, textvariable=self.status_var).pack(side=tk.LEFT)
-        
-    def log(self, message, tag="info"):
-        """添加日志消息"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n", tag)
-        self.log_text.see(tk.END)
-        self.root.update_idletasks()
-        
+
+        self.log_text = tk.Text(log_frame, height=12, wrap=tk.WORD, state=tk.DISABLED)
+        scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def setup_styles(self):
+        style = ttk.Style()
+        try:
+            style.theme_use('clam')
+        except:
+            pass
+
+        style.configure("Green.Horizontal.TProgressbar",
+                       troughcolor="#e0e0e0",
+                       background="#4CAF50",
+                       lightcolor="#66BB6A",
+                       darkcolor="#388E3C",
+                       bordercolor="#BDBDBD",
+                       borderwidth=1)
+
+        style.configure("Blue.Horizontal.TProgressbar",
+                       troughcolor="#e0e0e0",
+                       background="#2196F3",
+                       lightcolor="#64B5F6",
+                       darkcolor="#1976D2",
+                       bordercolor="#BDBDBD",
+                       borderwidth=1)
+
+        style.configure("Orange.Horizontal.TProgressbar",
+                       troughcolor="#e0e0e0",
+                       background="#FF9800",
+                       lightcolor="#FFB74D",
+                       darkcolor="#F57C00",
+                       bordercolor="#BDBDBD",
+                       borderwidth=1)
+
+        style.configure("Purple.Horizontal.TProgressbar",
+                       troughcolor="#e0e0e0",
+                       background="#9C27B0",
+                       lightcolor="#BA68C8",
+                       darkcolor="#7B1FA2",
+                       bordercolor="#BDBDBD",
+                       borderwidth=1)
+
+        style.configure("Cyan.Horizontal.TProgressbar",
+                       troughcolor="#e0e0e0",
+                       background="#00BCD4",
+                       lightcolor="#4DD0E1",
+                       darkcolor="#0097A7",
+                       bordercolor="#BDBDBD",
+                       borderwidth=1)
+
+        style.configure("Red.Horizontal.TProgressbar",
+                       troughcolor="#e0e0e0",
+                       background="#F44336",
+                       lightcolor="#EF5350",
+                       darkcolor="#D32F2F",
+                       bordercolor="#BDBDBD",
+                       borderwidth=1)
+
+        self.progress_bar_style = "Green.Horizontal.TProgressbar"
+        self.progress_bar.configure(style=self.progress_bar_style)
+
+    def update_sys_info(self):
+        self.sys_info_var.set(f"CPU: {self.cpu_cores} 核 | 内存: {self.ram_mb} MB | 推荐速率: {self.recommended_rate} pps")
+
     def check_dependencies(self):
-        """检查依赖"""
-        base = Path(__file__).parent
-        self.deps_ok = True
+        missing = []
+        if not MASSCAN_EXE.exists():
+            missing.append("masscan.exe")
+        if not CF_SCANNER_EXE.exists():
+            missing.append("cf-scanner.exe")
         
-        # 检查 cf-scanner.exe
-        cf_scanner = base / "cf-scanner.exe"
-        if not cf_scanner.exists():
-            self.log("⚠️ cf-scanner.exe 未找到", "warning")
-            self.deps_ok = False
+        try:
+            import geoip2
+            self.log("geoip2 库已安装")
+        except ImportError:
+            self.log("正在安装 geoip2 库...")
+            mirrors = [
+                "",
+                "-i https://pypi.tuna.tsinghua.edu.cn/simple",
+                "-i https://mirrors.aliyun.com/pypi/simple/",
+                "-i https://pypi.doubanio.com/simple/",
+                "-i https://pypi.mirrors.ustc.edu.cn/simple/",
+            ]
+            installed = False
+            for mirror in mirrors:
+                try:
+                    cmd = [sys.executable, "-m", "pip", "install", "geoip2", "-q"]
+                    if mirror:
+                        cmd.extend(mirror.split())
+                    subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                    import geoip2
+                    self.log(f"  安装成功")
+                    installed = True
+                    break
+                except Exception as e:
+                    if mirror:
+                        self.log(f"  镜像 {mirror[:30]}... 失败")
+                    else:
+                        self.log(f"  默认源失败")
+                    continue
+            if not installed:
+                self.log("  geoip2 安装失败，地区信息将为空", "warning")
         
-        # 检查 masscan.exe
-        masscan = base / "masscan.exe"
-        if not masscan.exists():
-            self.log("⚠️ masscan.exe 未找到", "warning")
-            self.log("   请从 https://github.com/robertdavidgraham/masscan/releases 下载 Windows 版本", "warning")
-            self.log("   并将 masscan.exe 放到当前目录", "warning")
-            self.deps_ok = False
-        
-        # 检查 verify.py
-        verify_py = base / "verify.py"
-        if not verify_py.exists():
-            self.log("⚠️ verify.py 未找到", "warning")
-            self.deps_ok = False
-        
-        if not self.deps_ok:
-            self.start_btn.config(state=tk.DISABLED)
-            self.status_var.set("缺少依赖，请检查日志")
-            
-    def refresh_check(self):
-        """刷新依赖检查"""
-        self.log_text.delete(1.0, tk.END)
-        self.check_dependencies()
-        if self.deps_ok:
-            self.status_var.set("依赖检查通过")
-            self.start_btn.config(state=tk.NORMAL)
-    
-    def on_verify_mode_change(self):
-        """验证模式切换"""
-        if self.verify_mode_var.get() == "api":
-            self.api_url_entry.config(state=tk.NORMAL)
-        else:
-            self.api_url_entry.config(state=tk.DISABLED)
-            
-    def start_scan(self):
-        """开始扫描"""
-        # 验证输入
-        asn_input = self.asn_var.get().strip()
-        if not asn_input:
-            messagebox.showerror("错误", "请输入 ASN 编号")
+        if missing:
+            self.log(f"缺少依赖: {', '.join(missing)}", "error")
+            return False
+        self.log("依赖检查通过")
+        return True
+
+    def log(self, msg, level="info"):
+        msg = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', msg)
+        msg = re.sub(r'\r', '', msg)
+        msg = re.sub(r'[^\x20-\x7E\u4e00-\u9fff]', '', msg)
+        if not msg.strip():
             return
-        
-        # 解析 ASN
-        asns = []
-        for a in asn_input.replace("，", ",").split(","):
-            a = a.strip().replace("AS", "").replace("as", "")
-            if a:
-                asns.append(a)
-        
-        if not asns:
-            messagebox.showerror("错误", "请输入有效的 ASN 编号")
+        def _append():
+            self.log_text.configure(state=tk.NORMAL)
+            self.log_text.insert(tk.END, msg + "\n")
+            self.log_text.see(tk.END)
+            self.log_text.configure(state=tk.DISABLED)
+        self.root.after(0, _append)
+
+    def update_progress(self, value, text=None, style=None):
+        def _update():
+            if style and style != self.progress_bar_style:
+                self.progress_bar_style = style
+                self.progress_bar.configure(style=self.progress_bar_style)
+            self.progress_bar['value'] = value
+            if text:
+                self.progress_var.set(text)
+        self.root.after(0, _update)
+
+    def start_progress_anim(self, base_value, range_value=5, base_text=""):
+        self._anim_base = base_value
+        self._anim_range = range_value
+        self._anim_running = True
+        self._anim_dots = 0
+        self._anim_text = base_text
+        self._progress_anim_tick()
+
+    def stop_progress_anim(self):
+        self._anim_running = False
+
+    def _progress_anim_tick(self):
+        if not self._anim_running:
             return
-        
-        # 更新UI状态
-        self.is_running = True
+        self._anim_dots = (self._anim_dots + 1) % 4
+        offset = (self._anim_dots * 0.5) * self._anim_range / 3
+        value = self._anim_base + offset
+        dots = "." * self._anim_dots
+        text = f"{self._anim_text}{dots}"
+        self.progress_bar['value'] = min(value, 99)
+        self.progress_var.set(text)
+        self.root.after(400, self._progress_anim_tick)
+
+    def open_output_dir(self):
+        try:
+            if IS_WINDOWS:
+                os.startfile(str(BASE))
+            else:
+                subprocess.Popen(["xdg-open", str(BASE)])
+        except Exception as e:
+            messagebox.showerror("错误", f"无法打开目录: {e}")
+
+    def load_cidrs_file(self):
+        cidrs_file = BASE / "cidrs.txt"
+        if not cidrs_file.exists():
+            messagebox.showwarning("提示", f"未找到 cidrs.txt: {cidrs_file}")
+            return
+        if not self.check_dependencies():
+            messagebox.showerror("错误", "缺少必要依赖，请检查")
+            return
+        self.scan_running = True
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state=tk.DISABLED)
         self.progress_bar['value'] = 0
-        self.log("=" * 50, "info")
-        self.log(f"开始扫描 ASN: {', '.join('AS' + a for a in asns)}", "info")
-        
-        # 启动扫描线程
-        thread = threading.Thread(target=self.run_scan, args=(asns,), daemon=True)
-        thread.start()
-        
+        self.progress_var.set("从 cidrs.txt 开始扫描")
+        threading.Thread(target=self.run_scan_from_cidrs, daemon=True).start()
+
+    def load_cf_hits_file(self):
+        hits_file = BASE / "cf_hits.txt"
+        if not hits_file.exists():
+            messagebox.showwarning("提示", f"未找到 cf_hits.txt: {hits_file}")
+            return
+        if not self.check_dependencies():
+            messagebox.showerror("错误", "缺少必要依赖，请检查")
+            return
+        self.scan_running = True
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+        self.progress_bar['value'] = 50
+        self.progress_var.set("从 cf_hits.txt 开始验证")
+        threading.Thread(target=self.run_scan_from_cf_hits, daemon=True).start()
+
+    def start_scan(self):
+        if self.scan_running:
+            return
+
+        asn_str = self.asn_var.get().strip()
+        if not asn_str:
+            messagebox.showwarning("提示", "请输入 ASN 编号")
+            return
+
+        if not self.check_dependencies():
+            messagebox.showerror("错误", "缺少必要依赖，请检查")
+            return
+
+        self.scan_running = True
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+        t = threading.Thread(target=self.run_scan, daemon=True)
+        t.start()
+
     def stop_scan(self):
-        """停止扫描"""
-        self.is_running = False
         if self.process:
             try:
                 self.process.terminate()
+                self.process.wait()
             except:
                 pass
-        self.log("用户中止扫描", "warning")
+        self.scan_running = False
+        self.stop_progress_anim()
+        self.log("扫描已停止")
         self.finish_scan()
-        
+
     def finish_scan(self):
-        """完成扫描"""
-        self.is_running = False
+        self.scan_running = False
+        self.stop_progress_anim()
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
-        self.status_var.set("就绪")
-        
-    def run_scan(self, asns):
-        """执行扫描"""
+        self.update_progress(100, "扫描完成", "Green.Horizontal.TProgressbar")
+
+    def probe_masscan_rate(self):
+        if not MASSCAN_EXE.exists():
+            return 4000
+        probe_cidr = "104.16.0.0/28"
+        probe_ports = "443"
+        rate = 1000
+        for test_rate in [1000, 2000, 4000, 8000]:
+            result_file = BASE / f"probe_{test_rate}.txt"
+            cmd = [
+                str(MASSCAN_EXE), probe_cidr,
+                "-p", probe_ports,
+                "--rate", str(test_rate),
+                "-oL", str(result_file),
+                "--wait", "0"
+            ]
+            try:
+                self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=CREATE_NO_WINDOW)
+                self.process.wait(timeout=15)
+                if result_file.exists():
+                    try:
+                        result_file.unlink()
+                    except:
+                        pass
+                rate = test_rate
+            except subprocess.TimeoutExpired:
+                if self.process:
+                    self.process.kill()
+                if result_file.exists():
+                    try:
+                        result_file.unlink()
+                    except:
+                        pass
+                break
+            except Exception:
+                if result_file.exists():
+                    try:
+                        result_file.unlink()
+                    except:
+                        pass
+                break
+            if not self.scan_running:
+                break
+        return max(rate, 500)
+
+    def run_scan(self):
         try:
-            base = Path(__file__).parent
-            
-            # Step 1: ASN → CIDR
-            self.progress_var.set("步骤 1/5: 获取 CIDR...")
-            self.log("\n[步骤 1/5] ASN → CIDR", "info")
-            
+            asn_str = self.asn_var.get().strip()
+            asns = [a.strip().replace("AS", "").replace("as", "") for a in asn_str.replace("，", ",").split(",") if a.strip()]
+
+            self.log(f"\n开始扫描 ASN: {asn_str}")
+            self.log("=" * 50)
+
+            self.update_progress(5, "准备中...", "Blue.Horizontal.TProgressbar")
+
+            ports = self.ports_var.get().strip()
+            if not ports:
+                ports = "443,8443,2053,2083,2087,2096"
+
+            rate_str = self.rate_var.get().strip()
+            if rate_str == "自动":
+                self.update_progress(10, "智能速率探测中", "Blue.Horizontal.TProgressbar")
+                self.root.after(0, lambda: self.start_progress_anim(10, 5, "智能速率探测中"))
+                self.log("\n[步骤 1/5] 智能速率探测")
+                rate = self.probe_masscan_rate()
+                self.root.after(0, self.stop_progress_anim)
+                self.recommended_rate = rate
+                self.root.after(0, self.update_sys_info)
+                self.log(f"  推荐速率: {rate} pps")
+            else:
+                rate = int(rate_str)
+
+            if not self.scan_running:
+                return
+
+            self.update_progress(15, "获取 CIDR...", "Blue.Horizontal.TProgressbar")
+            self.log("\n[步骤 2/5] ASN -> CIDR")
             cidrs = []
             for asn in asns:
                 url = f"https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn}"
@@ -337,260 +557,428 @@ class ASNIPtestGUI:
                             if ":" not in p["prefix"]:
                                 cidrs.append(p["prefix"])
                                 count += 1
-                        self.log(f"  AS{asn} → {count} 个 IPv4 CIDR", "success")
+                        self.log(f"  AS{asn} -> {count} 个 IPv4 CIDR")
                 except Exception as e:
-                    self.log(f"  AS{asn} → 失败: {e}", "error")
-            
-            if not cidrs:
-                self.log("未获取到任何 CIDR", "error")
-                self.finish_scan()
+                    self.log(f"  AS{asn} -> 失败: {e}", "error")
+
+            cidr_file = BASE / "cidrs.txt"
+            cidr_file.write_text("\n".join(cidrs), encoding="utf-8")
+            self.log(f"  共 {len(cidrs)} 个 CIDR")
+
+            if not self.scan_running:
                 return
-            
-            cidr_file = base / "cidrs.txt"
-            cidr_file.write_text("\n".join(cidrs))
-            self.log(f"  共 {len(cidrs)} 个 CIDR", "success")
-            self.progress_bar['value'] = 20
-            
-            if not self.is_running:
-                return
-            
-            # Step 2: masscan 端口扫描
-            self.progress_var.set("步骤 2/5: 端口扫描...")
-            self.log("\n[步骤 2/5] masscan 端口扫描", "info")
-            
-            masscan_exe = base / "masscan.exe"
-            if not masscan_exe.exists():
-                self.log("  masscan.exe 未找到，跳过端口扫描", "error")
-                self.log("  请从 https://github.com/robertdavidgraham/masscan/releases 下载", "warning")
-                self.finish_scan()
-                return
-            
-            result_file = base / "masscan_result.txt"
-            ports = self.ports_var.get()
-            
-            # 获取速率
-            rate_str = self.rate_var.get()
-            if rate_str == "自动":
-                rate = min(self.cpu_cores * 1000, 16000)
-            else:
-                rate = int(rate_str)
-            
-            self.log(f"  扫描端口: {ports}", "info")
-            self.log(f"  扫描速率: {rate} pps", "info")
-            
+
+            self.update_progress(30, "端口扫描中", "Orange.Horizontal.TProgressbar")
+            self.root.after(0, lambda: self.start_progress_anim(30, 8, "端口扫描中"))
+            self.log("\n[步骤 3/5] masscan 端口扫描")
+            self.log(f"  扫描端口: {ports}")
+            self.log(f"  扫描速率: {rate} pps")
+            result_file = BASE / "masscan_result.txt"
+
+            ports_file = BASE / "ports_gui.txt"
+            ports_file.write_text(ports + "\n", encoding="utf-8")
+
             cmd = [
-                str(masscan_exe), "-iL", str(cidr_file),
+                str(MASSCAN_EXE), "-iL", str(cidr_file),
                 "-p", ports,
                 "--rate", str(rate),
                 "-oL", str(result_file),
                 "--wait", "3"
             ]
-            
-            self.process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, cwd=str(base), creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            
-            # 读取输出
-            while True:
-                line = self.process.stderr.readline()
-                if not line and self.process.poll() is not None:
-                    break
-                if line:
-                    m = re.search(r"(\d+\.?\d*)%\s*done", line)
-                    if m:
-                        pct = float(m.group(1))
-                        self.progress_bar['value'] = 20 + pct * 0.3
-                        self.progress_var.set(f"端口扫描: {pct:.1f}%")
-            
-            self.process.wait()
-            
-            if self.process.returncode != 0:
-                self.log("  masscan 执行失败", "error")
+            try:
+                self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', cwd=str(BASE), creationflags=CREATE_NO_WINDOW)
+                while True:
+                    line = self.process.stderr.readline()
+                    if not line and self.process.poll() is not None:
+                        break
+                    if line:
+                        line_stripped = line.strip()
+                        m = re.search(r"(\d+\.?\d*)%\s*done", line_stripped)
+                        if m:
+                            pct = float(m.group(1))
+                            self.root.after(0, lambda val=pct: self.update_progress(30 + val * 0.2, f"端口扫描: {val:.1f}%", "Orange.Horizontal.TProgressbar"))
+                        elif line_stripped and not line_stripped.startswith("#"):
+                            self.log("  " + line_stripped)
+                    if not self.scan_running:
+                        self.process.kill()
+                        break
+                self.process.wait(timeout=60)
+                if self.process.returncode != 0:
+                    self.log(f"  masscan 执行失败 (返回码: {self.process.returncode})", "error")
+                    self.log("  请安装 Npcap 并以管理员身份运行", "warning")
+                    self.log("  Npcap 下载地址: https://nmap.org/npcap/", "warning")
+                    self.root.after(0, self.stop_progress_anim)
+                    self.finish_scan()
+                    return
+            except subprocess.TimeoutExpired:
+                self.log("  masscan 超时，强制终止", "error")
+                if self.process:
+                    self.process.kill()
+                    self.process.wait()
+            except Exception as e:
+                self.log(f"  masscan 运行失败: {e}", "error")
+                self.log("  请检查: 1. 是否已安装 WinPcap/Npcap  2. 是否以管理员身份运行", "error")
+                self.root.after(0, self.stop_progress_anim)
                 self.finish_scan()
                 return
-            
-            # 解析结果
+            self.root.after(0, self.stop_progress_anim)
+
             lines = []
             if result_file.exists():
-                with open(result_file) as f:
+                with open(result_file, encoding="utf-8", errors="replace") as f:
                     for line in f:
                         if line.startswith("#") or not line.strip():
                             continue
                         parts = line.strip().split()
                         if len(parts) >= 4 and parts[0] == "open":
                             lines.append(f"{parts[3]}:{parts[2]}")
-            
-            result_file.write_text("\n".join(lines) + "\n")
-            self.log(f"  开放端口: {len(lines)}", "success")
-            self.progress_bar['value'] = 50
-            
-            if not self.is_running:
+                result_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            self.log(f"  开放端口: {len(lines)}")
+
+            if not self.scan_running:
                 return
-            
+
             if len(lines) == 0:
-                self.log("无开放端口，扫描结束", "warning")
+                self.log("  无开放端口，扫描结束")
                 self.finish_scan()
                 return
-            
-            # Step 3: cf-scanner 粗筛
-            self.progress_var.set("步骤 3/5: CF 节点检测...")
-            self.log("\n[步骤 3/5] cf-scanner 粗筛", "info")
-            
-            cf_scanner_exe = base / "cf-scanner.exe"
-            hits_file = base / "cf_hits.txt"
-            
-            if not cf_scanner_exe.exists():
-                self.log("  cf-scanner.exe 未找到", "error")
-                self.finish_scan()
-                return
-            
-            concurrency = max(200, min(self.cpu_cores * 100, 500))
-            
-            self.process = subprocess.Popen(
-                [str(cf_scanner_exe), "-i", str(result_file), "-o", str(hits_file), "-c", str(concurrency)],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, cwd=str(base), creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            
-            while True:
-                line = self.process.stdout.readline()
-                if not line and self.process.poll() is not None:
-                    break
+
+            self.update_progress(50, "CF 粗筛中...", "Purple.Horizontal.TProgressbar")
+            self.log("\n[步骤 4/5] cf-scanner 粗筛")
+            hits_file = BASE / "cf_hits.txt"
+
+            cmd = [str(CF_SCANNER_EXE), "-i", str(result_file), "-o", str(hits_file), "-c", str(min(500, self.cpu_cores * 100))]
+            self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
+            for line in self.process.stdout:
                 if line:
-                    m = re.search(r"Scanned\s+\d+/(\d+)\s+\((\d+\.?\d*)%\)", line)
+                    line_stripped = line.strip()
+                    self.log("  " + line_stripped)
+                    m = re.search(r"(\d+\.?\d*)%", line_stripped)
                     if m:
-                        pct = float(m.group(2))
-                        self.progress_bar['value'] = 50 + pct * 0.2
-                        self.progress_var.set(f"CF 检测: {pct:.1f}%")
-            
+                        pct = float(m.group(1))
+                        self.update_progress(50 + pct * 0.25, f"CF 检测: {pct:.1f}%", "Purple.Horizontal.TProgressbar")
             self.process.wait()
-            
-            hits = sum(1 for _ in open(hits_file)) if hits_file.exists() else 0
-            self.log(f"  CF 节点: {hits}", "success")
-            self.progress_bar['value'] = 70
-            
-            if not self.is_running:
+
+            if not self.scan_running:
                 return
-            
+
+            hits = sum(1 for _ in open(hits_file, encoding="utf-8", errors="replace")) if hits_file.exists() else 0
+            self.log(f"  CF 节点: {hits}")
+
             if hits == 0:
-                self.log("无 CF 节点，扫描结束", "warning")
+                self.log("  未发现 CF 节点，扫描结束")
                 self.finish_scan()
                 return
-            
-            # Step 4: 精筛
-            verify_mode = self.verify_mode_var.get()
-            verify_concurrent = self.verify_concurrent_var.get()
-            verify_api = self.verify_api_var.get().strip()
-            
-            mode_text = "TLS本地验证" if verify_mode == "tls" else "API远程验证"
-            self.progress_var.set(f"步骤 4/5: {mode_text}...")
-            self.log(f"\n[步骤 4/5] {mode_text}", "info")
-            
-            verify_py = base / "verify.py"
-            verified_file = base / "verified.txt"
-            
-            if not verify_py.exists():
-                self.log("  verify.py 未找到", "error")
-                self.finish_scan()
-                return
-            
-            # 构建验证命令
+
+            self.update_progress(75, "验证中...", "Cyan.Horizontal.TProgressbar")
+            mode = self.verify_mode_var.get()
+            self.log(f"\n[步骤 5/5] {'TLS本地验证' if mode == 'tls' else 'API远程验证'}")
+
+            verified_file = BASE / "verified.txt"
+            api_url = self.api_url_var.get().strip()
+            concurrent = int(self.api_concurrent_var.get())
+
             cmd = [
-                sys.executable, str(verify_py),
+                sys.executable, str(VERIFY_PY),
                 "--input", str(hits_file),
                 "--output", str(verified_file),
-                "--mode", verify_mode,
+                "--api", api_url,
+                "--mode", mode,
                 "--chunk", "5000",
-                "--concurrent", str(verify_concurrent),
+                "--concurrent", str(concurrent),
                 "--fallback"
             ]
-            
-            # API模式添加API地址
-            if verify_mode == "api" and verify_api:
-                cmd.extend(["--api", verify_api])
-                self.log(f"  API地址: {verify_api}", "info")
-            
-            self.log(f"  验证并发: {verify_concurrent}", "info")
-            
-            self.process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, cwd=str(base), creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            
+            self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
+            for line in self.process.stdout:
+                if line:
+                    line_stripped = line.strip()
+                    self.log("  " + line_stripped)
+                    m = re.search(r"(\d+)/(\d+).*?通过 (\d+)", line_stripped)
+                    if m:
+                        done = int(m.group(1))
+                        total = int(m.group(2))
+                        if total > 0:
+                            pct = done / total * 100
+                            self.update_progress(75 + pct * 0.2, f"验证中: {pct:.1f}%", "Cyan.Horizontal.TProgressbar")
+            self.process.wait()
+
+            if not self.scan_running:
+                return
+
+            passed = sum(1 for _ in open(verified_file, encoding="utf-8", errors="replace")) - 1 if verified_file.exists() else 0
+            self.log(f"  精筛通过: {passed}")
+
+            if passed == 0:
+                self.log("  无有效节点，保留 CF 粗筛结果")
+                hits = sum(1 for _ in open(hits_file, encoding="utf-8", errors="replace")) if hits_file.exists() else 0
+                if hits > 0:
+                    self.log(f"  将 {hits} 个 CF 粗筛节点作为结果输出")
+                    with open(hits_file, encoding="utf-8", errors="replace") as f:
+                        cf_lines = [line.strip() for line in f if line.strip()]
+                    with open(verified_file, "w", encoding="utf-8") as f:
+                        f.write("IP地址,端口,TLS,数据中心,地区,城市,网络延迟,下载速度,ASN\n")
+                        for line in cf_lines:
+                            if ":" in line:
+                                ip_port = line.split()[0] if " " in line else line
+                                ip, port = ip_port.rsplit(":", 1)
+                                f.write(f"{ip},{port},TRUE,CLOUDFLARE,,,0,0,\n")
+                    passed = hits
+                else:
+                    self.log("  无 CF 节点，扫描结束")
+                    self.finish_scan()
+                    return
+
+            if self.enable_speed_var.get():
+                self.update_progress(95, "测速中...", "Green.Horizontal.TProgressbar")
+                self.log("\n[测速]")
+                self.run_speed_test(verified_file)
+
+            self.update_progress(98, "生成结果...", "Green.Horizontal.TProgressbar")
+            self.output_csv(asns)
+
+            self.log("\n" + "=" * 50)
+            self.log("扫描完成！")
+            self.finish_scan()
+
+        except Exception as e:
+            self.log(f"错误: {e}", "error")
+            import traceback
+            self.log(traceback.format_exc(), "error")
+            self.finish_scan()
+
+    def run_scan_from_cidrs(self):
+        try:
+            cidrs_file = BASE / "cidrs.txt"
+            with open(cidrs_file, encoding="utf-8") as f:
+                cidr_count = sum(1 for line in f if line.strip() and not line.startswith("#"))
+            self.log(f"[步骤 1/4] 使用 cidrs.txt，共 {cidr_count} 个 CIDR")
+
+            if self.rate_var.get() == "自动" and self.enable_speed_var.get():
+                self.update_progress(0, "智能速率探测中", "Blue.Horizontal.TProgressbar")
+                self.root.after(0, lambda: self.start_progress_anim(0, 10, "智能速率探测中"))
+                self.log("\n[步骤 2/4] 智能速率探测")
+                self.recommended_rate = self.probe_masscan_rate()
+                self.root.after(0, self.stop_progress_anim)
+                self.update_progress(15, f"推荐速率: {self.recommended_rate} pps", "Blue.Horizontal.TProgressbar")
+            else:
+                self.recommended_rate = int(self.rate_var.get()) if self.rate_var.get() != "自动" else 4000
+                self.update_progress(15, f"使用速率: {self.recommended_rate} pps", "Blue.Horizontal.TProgressbar")
+
+            ports = self.ports_var.get().strip()
+            result_file = BASE / "masscan_result.txt"
+            self.update_progress(15, "端口扫描中", "Orange.Horizontal.TProgressbar")
+            self.root.after(0, lambda: self.start_progress_anim(15, 15, "端口扫描中"))
+            self.log(f"\n[步骤 3/4] masscan 端口扫描")
+            self.log(f"  扫描端口: {ports}")
+            self.log(f"  扫描速率: {self.recommended_rate} pps")
+
+            ports_file = BASE / "ports_gui.txt"
+            ports_file.write_text(ports + "\n", encoding="utf-8")
+
+            cmd = [
+                str(MASSCAN_EXE), "-iL", str(cidrs_file),
+                "-p", ports,
+                "--rate", str(self.recommended_rate),
+                "-oL", str(result_file),
+                "--wait", "3"
+            ]
+            self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', cwd=str(BASE), creationflags=CREATE_NO_WINDOW)
             while True:
-                line = self.process.stdout.readline()
+                line = self.process.stderr.readline()
                 if not line and self.process.poll() is not None:
                     break
                 if line:
-                    m = re.search(r"\[(.+?)\].*?(\d+\.?\d*)%", line)
+                    line_stripped = line.strip()
+                    m = re.search(r"(\d+\.?\d*)%\s*done", line_stripped)
                     if m:
-                        pct = float(m.group(2))
-                        self.progress_bar['value'] = 70 + pct * 0.2
-                        self.progress_var.set(f"验证中: {pct:.1f}%")
-            
-            self.process.wait()
-            
-            passed = sum(1 for _ in open(verified_file)) - 1 if verified_file.exists() else 0  # 减去标题行
-            self.log(f"  精筛通过: {passed}", "success")
-            self.progress_bar['value'] = 90
-            
-            if not self.is_running:
+                        pct = float(m.group(1))
+                        self.root.after(0, lambda val=pct: self.update_progress(15 + val * 0.2, f"端口扫描: {val:.1f}%", "Orange.Horizontal.TProgressbar"))
+                    elif line_stripped and not line_stripped.startswith("#"):
+                        self.log("  " + line_stripped)
+                if not self.scan_running:
+                    self.process.kill()
+                    break
+            self.process.wait(timeout=60)
+            self.root.after(0, self.stop_progress_anim)
+
+            if not self.scan_running:
                 return
-            
-            # Step 5: 测速（可选）
-            if self.speed_test_var.get():
-                self.progress_var.set("步骤 5/5: 测速...")
-                self.log("\n[步骤 5/5] 测速", "info")
-                self.run_speed_test(verified_file)
-            
-            # 输出结果
-            self.output_result(asns, verified_file)
-            
-            self.progress_bar['value'] = 100
-            self.progress_var.set("扫描完成")
-            self.log("\n✓ 扫描完成！", "success")
-            
+
+            lines = []
+            if result_file.exists():
+                with open(result_file, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if line.startswith("#") or not line.strip():
+                            continue
+                        parts = line.strip().split()
+                        if len(parts) >= 4 and parts[0] == "open":
+                            lines.append(f"{parts[3]}:{parts[2]}")
+                result_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            self.log(f"  开放端口: {len(lines)}")
+
+            if len(lines) == 0:
+                self.log("  无开放端口，跳过 cf-scanner")
+                self.log("  未发现 CF 节点，扫描结束")
+                self.finish_scan()
+                return
+
+            self.update_progress(50, "CF 粗筛中...", "Purple.Horizontal.TProgressbar")
+            self.log("\n[步骤 4/4] cf-scanner 粗筛")
+            hits_file = BASE / "cf_hits.txt"
+
+            cmd = [str(CF_SCANNER_EXE), "-i", str(result_file), "-o", str(hits_file), "-c", str(min(500, self.cpu_cores * 100))]
+            self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
+            for line in self.process.stdout:
+                if line:
+                    line_stripped = line.strip()
+                    self.log("  " + line_stripped)
+                    m = re.search(r"(\d+\.?\d*)%", line_stripped)
+                    if m:
+                        pct = float(m.group(1))
+                        self.update_progress(50 + pct * 0.25, f"CF 检测: {pct:.1f}%", "Purple.Horizontal.TProgressbar")
+            self.process.wait()
+
+            if not self.scan_running:
+                return
+
+            hits = sum(1 for _ in open(hits_file, encoding="utf-8", errors="replace")) if hits_file.exists() else 0
+            self.log(f"  CF 节点: {hits}")
+
+            if hits == 0:
+                self.log("  未发现 CF 节点，扫描结束")
+                self.finish_scan()
+                return
+
+            self.run_verify_and_speed(hits_file)
+
         except Exception as e:
             self.log(f"错误: {e}", "error")
-        finally:
+            import traceback
+            self.log(traceback.format_exc(), "error")
             self.finish_scan()
-    
+
+    def run_scan_from_cf_hits(self):
+        try:
+            hits_file = BASE / "cf_hits.txt"
+            hits = sum(1 for _ in open(hits_file, encoding="utf-8", errors="replace"))
+            self.log(f"[直接验证] 使用 cf_hits.txt，共 {hits} 个候选节点")
+
+            self.run_verify_and_speed(hits_file)
+
+        except Exception as e:
+            self.log(f"错误: {e}", "error")
+            import traceback
+            self.log(traceback.format_exc(), "error")
+            self.finish_scan()
+
+    def run_verify_and_speed(self, hits_file):
+        self.update_progress(75, "验证中...", "Cyan.Horizontal.TProgressbar")
+        mode = self.verify_mode_var.get()
+        self.log(f"\n[验证] {'TLS本地验证' if mode == 'tls' else 'API远程验证'}")
+
+        verified_file = BASE / "verified.txt"
+        api_url = self.api_url_var.get().strip()
+        concurrent = int(self.api_concurrent_var.get())
+
+        cmd = [
+            sys.executable, str(VERIFY_PY),
+            "--input", str(hits_file),
+            "--output", str(verified_file),
+            "--api", api_url,
+            "--mode", mode,
+            "--chunk", "5000",
+            "--concurrent", str(concurrent),
+            "--fallback"
+        ]
+        self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
+        for line in self.process.stdout:
+            if line:
+                line_stripped = line.strip()
+                self.log("  " + line_stripped)
+                m = re.search(r"(\d+)/(\d+).*?通过 (\d+)", line_stripped)
+                if m:
+                    done = int(m.group(1))
+                    total = int(m.group(2))
+                    if total > 0:
+                        pct = done / total * 100
+                        self.update_progress(75 + pct * 0.2, f"验证中: {pct:.1f}%", "Cyan.Horizontal.TProgressbar")
+        self.process.wait()
+
+        if not self.scan_running:
+            return
+
+        passed = sum(1 for _ in open(verified_file, encoding="utf-8", errors="replace")) - 1 if verified_file.exists() else 0
+        self.log(f"  精筛通过: {passed}")
+
+        if passed == 0:
+            self.log("  无有效节点，保留 CF 粗筛结果")
+            hits = sum(1 for _ in open(hits_file, encoding="utf-8", errors="replace")) if hits_file.exists() else 0
+            if hits > 0:
+                self.log(f"  将 {hits} 个 CF 粗筛节点作为结果输出")
+                with open(hits_file, encoding="utf-8", errors="replace") as f:
+                    cf_lines = [line.strip() for line in f if line.strip()]
+                with open(verified_file, "w", encoding="utf-8") as f:
+                    f.write("IP地址,端口,TLS,数据中心,地区,城市,网络延迟,下载速度,ASN\n")
+                    for line in cf_lines:
+                        if ":" in line:
+                            ip_port = line.split()[0] if " " in line else line
+                            ip, port = ip_port.rsplit(":", 1)
+                            f.write(f"{ip},{port},TRUE,CLOUDFLARE,,,0,0,\n")
+                passed = hits
+            else:
+                self.log("  无 CF 节点，扫描结束")
+                self.finish_scan()
+                return
+
+        if self.enable_speed_var.get():
+            self.update_progress(95, "测速中...", "Green.Horizontal.TProgressbar")
+            self.log("\n[测速]")
+            self.run_speed_test(verified_file)
+
+        self.update_progress(98, "生成结果...", "Green.Horizontal.TProgressbar")
+        self.output_csv([])
+
+        self.log("\n" + "=" * 50)
+        self.log("扫描完成！")
+        self.finish_scan()
+
     def run_speed_test(self, verified_file):
-        """执行测速"""
         if not verified_file.exists():
             return
-        
+
         lines = []
-        with open(verified_file) as f:
+        with open(verified_file, encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith("#") or line.startswith("IP地址"):
+                if not line or line.startswith("#"):
                     continue
-                if line.count(",") >= 8:
+                if line.startswith("IP"):
                     lines.append(line)
-        
-        if not lines:
+                    continue
+                lines.append(line)
+
+        if len(lines) <= 1:
+            self.log("  无节点，跳过")
             return
-        
-        total = len(lines)
+
+        header = lines[0]
+        entries = lines[1:]
+        total = len(entries)
         tested = 0
-        
+        speed_url = self.speed_url_var.get().strip()
+
+        self.log(f"  节点数: {total}")
+
         with open(verified_file, "w", encoding="utf-8") as f:
-            f.write("IP地址,端口,TLS,数据中心,地区,城市,网络延迟,下载速度,ASN\n")
-            
-            for entry in lines:
-                if not self.is_running:
+            f.write(header + "\n")
+            for entry in entries:
+                if not self.scan_running:
                     break
-                    
                 parts = entry.split(",")
                 if len(parts) < 9:
                     continue
-                
                 ip, port = parts[0], parts[1]
-                
-                # TCP 延迟
+
                 latency = 0
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -601,119 +989,69 @@ class ASNIPtestGUI:
                     s.close()
                 except:
                     pass
-                
-                # 下载速度
-                speed_mbps = 0
+
+                speed_kbps = 0
                 if latency > 0:
                     try:
-                        import tempfile
-                        from urllib.parse import urlparse
-                        
-                        speed_test_url = self.speed_test_url_var.get().strip()
-                        if not speed_test_url:
-                            speed_test_url = "https://speed.cloudflare.com/__down?bytes=1048576"
-                        
-                        # 从网址提取域名
-                        parsed = urlparse(speed_test_url)
-                        domain = parsed.hostname or "speed.cloudflare.com"
-                        url_port = parsed.port or 443
-                        
-                        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                            tmp_path = tmp.name
-                        
-                        r = subprocess.run(
-                            ["curl", "--connect-to", f"{domain}:{url_port}:{ip}:{port}",
-                             "-o", tmp_path, "-s", "-w", "%{speed_download}",
-                             "--connect-timeout", "5", "--max-time", "10",
-                             speed_test_url],
-                            capture_output=True, text=True, timeout=15,
-                            creationflags=subprocess.CREATE_NO_WINDOW
-                        )
-                        os.remove(tmp_path)
+                        r = subprocess.run([
+                            "curl", "--connect-to", f"speed.cloudflare.com:443:{ip}:{port}",
+                            "-o", "NUL" if IS_WINDOWS else "/dev/null", "-s", "-w", "%{speed_download}",
+                            "--connect-timeout", "5", "--max-time", "10",
+                            speed_url
+                        ], capture_output=True, text=True, timeout=15, creationflags=CREATE_NO_WINDOW)
                         speed_bps = float(r.stdout.strip() or 0)
-                        speed_mbps = round(speed_bps * 8 / 1000000, 2)
+                        speed_kbps = round(speed_bps / 1024)
                     except:
                         pass
-                
+
                 parts[6] = str(latency)
-                parts[7] = str(speed_mbps)
+                parts[7] = str(speed_kbps)
                 f.write(",".join(parts) + "\n")
-                
+
                 tested += 1
-                pct = tested / total * 100
-                self.progress_var.set(f"测速: {tested}/{total} ({pct:.1f}%)")
-        
-        self.log(f"  测速完成: {tested} 个节点", "success")
-    
-    def output_result(self, asns, verified_file):
-        """输出结果"""
-        base = Path(__file__).parent
-        
-        if not verified_file.exists():
+                if tested % 5 == 0 or tested == total:
+                    pct = tested / total * 100
+                    self.update_progress(95 + pct * 0.05, f"测速: {tested}/{total}")
+                    self.log(f"  {tested}/{total} | 延迟 {latency}ms  速度 {speed_kbps}KB/s")
+
+        self.log(f"  测速完成: {total} 个节点")
+
+    def output_csv(self, asns):
+        verified_file = BASE / "verified.txt"
+        if not verified_file.exists() or verified_file.stat().st_size == 0:
+            self.log("  无结果")
             return
-        
+
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         asn_tag = "_".join(asns)
-        output = base / f"output_{asn_tag}_{ts}.csv"
-        
+        output = BASE / f"result_{asn_tag}_{ts}.csv"
+
         lines = []
-        with open(verified_file) as f:
+        with open(verified_file, encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith("#") or line.startswith("IP地址"):
+                if not line or line.startswith("#") or line.startswith("IP"):
                     continue
                 if line.count(",") >= 8:
                     lines.append(line)
-        
-        with open(output, "w", encoding="utf-8-sig") as f:
+
+        with open(output, "w", encoding="utf-8") as f:
             f.write("IP地址,端口,TLS,数据中心,地区,城市,网络延迟,下载速度,ASN\n")
             for line in lines:
                 f.write(line + "\n")
-        
-        self.log(f"\n结果: {len(lines)} 条 → {output.name}", "success")
-        self.status_var.set(f"完成: {output.name}")
-        
-        # 询问是否打开文件
-        if messagebox.askyesno("扫描完成", f"找到 {len(lines)} 个节点\n\n是否打开结果文件？"):
-            os.startfile(str(output))
-    
-    def open_output_dir(self):
-        """打开输出目录"""
-        base = Path(__file__).parent
-        os.startfile(str(base))
-    
-    def show_help(self):
-        """显示帮助"""
-        help_text = """ASNIPtest - Cloudflare 节点扫描工具
 
-【使用方法】
-1. 输入 ASN 编号（如 AS209242，多个用逗号分隔）
-2. 选择扫描端口（默认 443,8443,2053,2083,2087,2096）
-3. 点击"开始扫描"
-
-【工作流程】
-1. ASN → CIDR：查询 RIPEStat API 获取 IP 段
-2. masscan 端口扫描：高速 SYN 扫描
-3. cf-scanner 粗筛：TLS 握手检测 Cloudflare 节点
-4. API 精筛：二次验证节点可用性
-5. 测速（可选）：TCP 延迟 + 下载速度测试
-
-【注意事项】
-• masscan 需要管理员权限运行
-• 扫描速率建议根据网络情况调整
-• 首次使用请确保 masscan.exe 已下载
-
-【输出格式】
-CSV 文件包含：IP地址、端口、TLS、数据中心、地区、城市、网络延迟、下载速度、ASN
-"""
-        messagebox.showinfo("使用帮助", help_text)
-
+        self.log(f"  结果: {len(lines)} 条 -> {output.name}")
+        return output
 
 def main():
     root = tk.Tk()
+    try:
+        style = ttk.Style()
+        style.theme_use('clam')
+    except:
+        pass
     app = ASNIPtestGUI(root)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()

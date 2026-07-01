@@ -1,201 +1,175 @@
-# ASNIPtest Windows 版本使用说明
+# ASNIPtest Windows 版
 
-## 概述
+基于 [D-adis/ASNIPtest-New](https://github.com/D-adis/ASNIPtest-New) 的 Windows 定制版，增加了 GUI 界面、智能速率探测、TLS 本地验证等功能。
 
-ASNIPtest Windows 移植版本，用于从 ASN 编号出发，自动完成 IP 段拉取 → 端口扫描 → Cloudflare 反代节点检测。
+## 功能特性
 
-### 主要特性
+### 原版功能
+- 从 ASN 拉取 IP 段
+- masscan 快速端口扫描
+- cf-scanner Cloudflare 节点粗筛
+- API 远程验证精筛
+- 下载测速
 
-- **图形界面**：简单易用的 GUI 界面
-- **本地 TLS 验证**：精筛使用本地 TLS 握手验证，无需依赖外部 API
-- **智能回退**：精筛失败时自动保留粗筛结果，确保不丢失数据
-- **中间文件保存**：每个步骤的结果都会保存，方便后续复用
+### Windows 版增强
+- ✅ **图形界面 (GUI)** - 可视化操作，实时进度显示
+- ✅ **智能速率探测** - 实测网卡发包上限，动态调整 masscan 速率
+- ✅ **TLS 本地验证** - 不依赖外部 API，本地检测 Cloudflare 证书
+- ✅ **本地 GeoIP 查询** - 内置 GeoLite2 数据库，本地查询地区/城市信息
+- ✅ **国内镜像支持** - geoip2 库安装自动切换国内镜像源，解决网络超时
+- ✅ **进度条显示** - 实时显示各阶段扫描进度
+- ✅ **原生 Windows 支持** - 无需 WSL2，直接运行
 
-## 前置依赖
+## 系统要求
 
-### 1. Python 3.8+
-- 下载地址：https://www.python.org/downloads/windows/
-- 安装时勾选 **"Add Python to PATH"**
+- Windows 10/11
+- Python 3.8+
+- [masscan.exe](https://github.com/robertdavidgraham/masscan/releases) - 端口扫描工具
+- [cf-scanner.exe](https://github.com/D-adis/ASNIPtest-New/releases) - Cloudflare 节点粗筛工具
+- WinPcap 或 Npcap（masscan 依赖）
+  - WinPcap: https://www.winpcap.org/
+  - Npcap: https://nmap.org/npcap/
 
-### 2. Masscan Windows 版本
-- 下载地址：https://github.com/robertdavidgraham/masscan/releases
-- 下载 `masscan-*-windows.zip` 文件
-- 解压后将 `masscan.exe` 放到项目目录
+> **说明**：geoip2 库和 GeoLite2-City.mmdb 数据库会在首次运行时自动下载安装，无需手动配置。
 
-## 文件结构
+## 安装步骤
 
-```
-ASNIPtest/
-├── asnip_gui.py        # GUI 图形界面程序
-├── start_gui.bat       # GUI 启动脚本（双击运行）
-├── cf-scanner.exe      # Cloudflare 节点检测工具（已编译）
-├── masscan.exe         # 端口扫描工具（需下载）
-├── verify.py           # TLS 精筛模块
-├── run.bat             # 命令行启动脚本
-├── run_win.py          # Windows 版本主程序
-├── ports.txt           # 默认扫描端口列表
-├── README_Windows.md   # 本说明文档
-│
-├── [中间文件 - 扫描后生成]
-├── cidrs.txt           # ASN 对应的 IP 段
-├── masscan_result.txt  # masscan 扫描结果
-├── cf_hits.txt         # 粗筛发现的 CF 节点
-├── verified.txt        # 精筛后的节点列表
-└── output_*.csv        # 最终输出结果
+### 方法一：快速安装
+
+1. 克隆或下载本项目
+2. 下载 masscan Windows 版并解压，将 `masscan.exe` 放到项目目录
+3. 下载 cf-scanner Windows 版，将 `cf-scanner.exe` 放到项目目录
+4. 双击运行 `install_windows.bat` 检查依赖
+
+### 方法二：手动安装
+
+```bash
+# 1. 克隆项目
+git clone https://github.com/D-adis/ASNIPtest-New.git
+cd ASNIPtest-New
+
+# 2. 下载 masscan.exe 放到当前目录
+# 下载地址: https://github.com/robertdavidgraham/masscan/releases
+
+# 3. 编译或下载 cf-scanner.exe 放到当前目录
+cd cf-scanner-src
+go build -o ../cf-scanner.exe main.go
+cd ..
+
+# 4. 验证
+python --version
 ```
 
 ## 使用方法
 
-### 方法一：图形界面（推荐）
+### 图形界面（推荐）
 
-1. 双击 `start_gui.bat`
-2. 在界面中输入 **ASN 编号**（如 `AS209242`）
-3. 选择扫描端口（默认：`443,8443,2053,2083,2087,2096`）
-4. 可选：勾选"启用测速"
-5. 点击 **"开始扫描"**
+双击 `start_gui.bat` 启动图形界面：
 
-### 方法二：命令行模式
+1. 输入 ASN 编号（多个用逗号分隔），如 `AS209242`
+2. 选择扫描端口，默认 `443,8443,2053,2083,2087,2096`
+3. 选择扫描速率（自动模式会智能探测）
+4. 选择验证模式：
+   - **TLS 本地验证** - 本地检测证书，速度快，不依赖网络
+   - **API 远程验证** - 通过 API 验证反代能力，结果更准确
+5. 点击「开始扫描」
 
-```cmd
-run.bat AS209242                    # 单个 ASN
-run.bat AS209242,AS13335            # 多个 ASN
-run.bat AS209242 -p 443,8443        # 自定义端口
+### 命令行模式
+
+```bash
+# 扫描单个 ASN
+run.bat AS209242
+
+# 扫描多个 ASN
+run.bat AS209242,AS3214
 ```
 
-### 方法三：直接运行 Python
+## 文件说明
 
-```cmd
-python asnip_gui.py                # 图形界面
-python run_win.py AS209242         # 命令行模式
-```
+| 文件 | 说明 |
+|------|------|
+| `asnip_gui.py` | 图形界面主程序 |
+| `run_win.py` | Windows 命令行版本 |
+| `verify.py` | 验证工具（支持 TLS 和 API 两种模式） |
+| `start_gui.bat` | 启动图形界面 |
+| `run.bat` | 命令行启动脚本 |
+| `install_windows.bat` | Windows 安装检查脚本 |
+| `ports.txt` | 扫描端口配置 |
 
-## 工作流程
+## 验证模式说明
 
-```
-用户输入 ASN
-    │
-    ▼
-┌──────────────────────┐
-│ 1. ASN → CIDR       │  RIPEStat API 查询该 ASN 广播的所有 IPv4 前缀
-├──────────────────────┤
-│ 2. masscan 端口扫描  │  高速 SYN 扫描，发现开放端口
-├──────────────────────┤
-│ 3. cf-scanner 粗筛   │  TLS 握手检测，筛选 Cloudflare 节点
-├──────────────────────┤
-│ 4. 验证             │  TLS本地验证 或 API远程验证
-│                      │  ✨ 验证失败时自动保留粗筛结果
-├──────────────────────┤
-│ 5. 测速（可选）       │  TCP 延迟 + Cloudflare 下载速度
-├──────────────────────┤
-│ 输出 CSV             │  生成结果文件
-└──────────────────────┘
-```
+### TLS 本地验证
+- 原理：通过 TLS 握手检测证书，并发送 HTTP 请求测试实际反代能力
+- 验证条件：证书由 Cloudflare 签发 + 响应包含 `Server: cloudflare` 或 `CF-RAY` + 非 52x 错误状态码
+- 优点：速度快，不依赖外部 API，无网络请求
+- 缺点：准确性有限，部分非反代 IP 可能通过验证
 
-## 常用 Cloudflare ASN
+### API 远程验证（推荐）
+- 原理：通过 api.090227.xyz/check API 验证反代能力，模拟实际反代请求
+- 优点：能准确确认 IP 的反代能力，结果可靠，默认模式
+- 缺点：依赖外部 API，需要网络连接
 
-| ASN | 说明 |
-|-----|------|
-| AS209242 | Cloudflare Inc.（主 ASN） |
-| AS13335 | Cloudflare Inc.（备用） |
-| AS3214 | Orange S.A.（部分节点） |
-| AS7473 | 新加坡 Starhub 网段 |
-
-## 中间文件说明
-
-扫描过程中会自动生成以下中间文件：
-
-| 文件 | 说明 | 用途 |
-|------|------|------|
-| `cidrs.txt` | ASN 对应的 IP 段 | 记录查询到的 CIDR 列表 |
-| `masscan_result.txt` | 端口扫描结果 | masscan 发现的所有开放端口 |
-| `cf_hits.txt` | 粗筛 CF 节点 | cf-scanner 初步筛选的节点 |
-| `verified.txt` | 精筛结果 | 通过 TLS 验证的节点 |
-
-### 后期再次扫描
-
-如果想要复用之前的扫描结果：
-
-1. **保留中间文件**：不需要重新扫描时，不要删除 `cf_hits.txt`
-2. **单独运行精筛**：
-   ```cmd
-   python verify.py --input cf_hits.txt --output result.csv --mode tls
-   ```
-3. **修改后重新运行**：编辑 `cf_hits.txt` 添加或删除节点，然后重新运行精筛
-
-## 输出格式
-
-运行完成后生成 CSV 文件（`output_*.csv`），包含以下列：
-
-| 列 | 说明 | 示例 |
-|---|---|---|
-| IP地址 | Cloudflare 节点 IP | `162.159.192.1` |
-| 端口 | TLS 端口 | `443` |
-| TLS | TLS 版本 | `TRUE` |
-| 数据中心 | CF 数据中心代号 | `HKG` |
-| 地区 | 国家/地区代码 | `HK` |
-| 城市 | 城市名 | `Hong Kong` |
-| 网络延迟 | TCP 延迟 (ms) | `42` |
-| 下载速度 | 下载带宽 (Mbps) | `5.12` |
-| ASN | 源 ASN 编号 | `AS209242` |
-
-> 注意：如果精筛未通过任何节点，粗筛保留的节点在"城市"列会标记为 **"粗筛保留"**
-
-## 验证设置
-
-程序支持两种验证模式：
-
-### TLS 本地验证（默认）
-- **优点**：无需外部 API，完全本地运行，隐私性好
-- **缺点**：无法获取地理位置信息
-- **适用场景**：大多数情况下推荐使用
-
-### API 远程验证
-- **优点**：可获取地理位置、数据中心等信息
-- **缺点**：依赖外部 API，需要稳定的网络连接
-- **适用场景**：需要详细信息时使用
-
-### 自定义参数
-
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| 验证模式 | TLS本地验证 / API远程验证 | TLS本地验证 |
-| API 地址 | API验证模式使用的接口地址 | `https://api.090227.xyz/check` |
-| 验证并发 | 同时验证的连接数 | 64（根据CPU自动调整）|
-
-> 注意：TLS本地验证在验证失败时会自动保留粗筛结果，确保不丢失数据
-
-## 注意事项
-
-### 权限要求
-- **masscan 需要管理员权限**：右键点击命令提示符，选择"以管理员身份运行"
-- GUI 启动脚本也需要以管理员权限运行
-
-### 网络兼容性
-- masscan 使用 raw socket，在某些网络环境下可能受限
-- 如果扫描失败，请尝试切换网络（如使用手机热点）
-- 某些 VPN 或代理可能影响扫描结果
-
-### 扫描速率
-- 默认根据 CPU 核心数自动设置
-- 如果网络不稳定，建议降低扫描速率（如 1000 pps）
+### 回退机制
+API 验证模式下，如果全部验证失败，会自动回退到 TLS 本地验证模式。
 
 ## 常见问题
 
-### Q: masscan 报错 "permission denied"
-**A**: 请以管理员身份运行命令提示符，masscan 需要 raw socket 权限。
+### 1. masscan 报错找不到 npf
+安装 WinPcap 或 Npcap：
+- WinPcap: https://www.winpcap.org/
+- Npcap: https://nmap.org/npcap/
 
-### Q: 扫描速度很慢
-**A**: Windows 上 masscan 性能可能不如 Linux，建议在设置中降低扫描速率。
+### 2. 扫描速率上不去
+- 以管理员身份运行
+- 在「网络适配器」中禁用不必要的网络接口
+- 使用更大的扫描速率（注意可能触发 ISP 限速）
 
-### Q: 精筛通过数量为 0
-**A**: 这是正常现象！程序会自动保留粗筛发现的所有 CF 节点（标记为"粗筛保留"）。
+### 3. 找不到 CF 节点
+- 确认扫描的 ASN 是否正确，推荐使用 `AS209242` 或 `AS13335`
+- 检查 masscan 是否正常工作
+- 尝试使用 TLS 验证模式
 
-### Q: 如何后期再次使用之前的扫描结果？
-**A**: 直接运行 `python verify.py --input cf_hits.txt --output result.csv --mode tls`
+### 4. API 验证全部失败
+- 检查网络连接是否正常
+- 尝试使用 TLS 本地验证模式
+- 确认 API 地址是否正确
 
-### Q: 无法获取公网 IP
-**A**: 检查网络连接，确保可以访问外部网站。
+### 5. geoip2 库安装失败
+- 程序会自动尝试多个国内镜像源（清华、阿里、豆瓣、中科大）
+- 如果全部失败，地区/城市信息将为空，不影响其他功能
+- 可手动安装：`pip install geoip2 -i https://pypi.tuna.tsinghua.edu.cn/simple`
 
-## 技术支持
+### 6. GeoIP 数据库下载失败
+- 程序会自动尝试多个下载源
+- 如果全部失败，可手动下载 GeoLite2-City.mmdb 放到项目目录
+- 下载地址：https://raw.gitmirror.com/adysec/IP_database/main/geolite/GeoLite2-City.mmdb
 
-如有问题，请访问项目主页：https://github.com/e13815332/ASNIPtest
+## 推荐 ASN
+
+- **AS209242** - Cloudflare 主要 ASN，节点最多
+- **AS13335** - Cloudflare 经典 ASN
+- **AS3214** - 部分地区可用
+
+## 输出文件
+
+扫描结果保存在项目目录下，文件名格式：
+`result_{ASN编号}_{时间戳}.csv`
+
+CSV 字段：
+- IP地址 - 节点 IP
+- 端口 - 开放端口
+- TLS - 是否支持 TLS
+- 数据中心 - Cloudflare 数据中心（三字母代码）
+- 地区 - 国家/地区
+  - API 模式：由 API 返回
+  - TLS 模式：通过本地 GeoLite2 数据库查询
+- 城市 - 城市
+  - API 模式：由 API 返回
+  - TLS 模式：通过本地 GeoLite2 数据库查询
+- 网络延迟 - 延迟(ms)
+- 下载速度 - 速度(KB/s)
+- ASN - ASN 编号
+
+## License
+
+与原项目保持一致。
